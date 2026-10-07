@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,11 +18,8 @@ import (
 func TestCreatePayment(t *testing.T) {
 	var seen []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/gateway/payments" {
-			t.Errorf("path = %s", r.URL.Path)
-		}
-		if r.Header.Get("X-Voybit-Api-Key") != "vb_test_example_secret" {
-			t.Errorf("missing api key")
+		if r.URL.Path != "/gateway/payments" || r.Header.Get("X-Voybit-Api-Key") != "vb_test_example_secret" {
+			t.Errorf("request = %s %s", r.URL.Path, r.Header.Get("X-Voybit-Api-Key"))
 		}
 		if r.Header.Get("Idempotency-Key") != "order:1001:attempt:1" {
 			t.Errorf("idempotency = %s", r.Header.Get("Idempotency-Key"))
@@ -45,7 +43,7 @@ func TestCreatePayment(t *testing.T) {
 			"expires_at":"2026-10-07T16:30:00Z",
 			"created_at":"2026-10-07T16:00:00Z",
 			"updated_at":"2026-10-07T16:00:00Z",
-			"deposit_instructions":{"status":"ready","address":"TExample","amount":"25.0000","asset":"USDT","network":"tron","message":"Send exactly the displayed amount."}
+			"deposit_instructions":{"status":"ready","address":"TExample","payment_uri":"tron:TExample","amount":"25.0000","asset":"USDT","network":"tron","message":"Send the exact amount."}
 		}`))
 	}))
 	defer server.Close()
@@ -56,13 +54,13 @@ func TestCreatePayment(t *testing.T) {
 		CryptoAmount: "25.0000",
 		AmountMinor:  2500,
 		FiatCurrency: "USD",
-		Description:  "Order #1001",
+		Description:  "Order 1001",
 		Metadata:     map[string]any{"order_id": "1001"},
 	}, "order:1001:attempt:1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.Payment.CheckoutURL == "" || created.Payment.Deposit.Address != "TExample" || created.Replayed {
+	if created.Payment.CheckoutURL == "" || created.Payment.Deposit.Address != "TExample" || created.Payment.Deposit.URI == "" || created.Replayed {
 		t.Fatalf("payment = %#v", created)
 	}
 	var sent CreatePaymentRequest
@@ -89,7 +87,7 @@ func TestCreatePaymentDoesNotRetryValidation(t *testing.T) {
 		AssetID: "asset", CryptoAmount: "1", AmountMinor: 100, FiatCurrency: "USD",
 	}, "order:1001:attempt:1")
 	var apiErr *APIError
-	if !errorsAs(err, &apiErr) || apiErr.Code != "asset_unavailable" || calls != 1 {
+	if !errors.As(err, &apiErr) || apiErr.Code != "asset_unavailable" || apiErr.RequestID != "" || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
 }
@@ -100,8 +98,8 @@ func TestVerifyWebhook(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	stamp := strconv.FormatInt(now.Unix(), 10)
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte("delivery-1." + stamp + "."))
-	mac.Write(raw)
+	_, _ = mac.Write([]byte("delivery-1." + stamp + "."))
+	_, _ = mac.Write(raw)
 	signature := "v1=" + hex.EncodeToString(mac.Sum(nil))
 
 	if err := VerifyWebhook(secret, "delivery-1", stamp, signature, raw, now); err != nil {
@@ -115,15 +113,11 @@ func TestVerifyWebhook(t *testing.T) {
 		t.Fatal("tampered body was accepted")
 	}
 	old := strconv.FormatInt(now.Add(-6*time.Minute).Unix(), 10)
-	if err := VerifyWebhook(secret, "delivery-1", old, signature, raw, now); err == nil {
+	mac = hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte("delivery-1." + old + "."))
+	_, _ = mac.Write(raw)
+	oldSignature := "v1=" + hex.EncodeToString(mac.Sum(nil))
+	if err := VerifyWebhook(secret, "delivery-1", old, oldSignature, raw, now); err == nil {
 		t.Fatal("old timestamp was accepted")
 	}
-}
-
-func errorsAs(err error, target **APIError) bool {
-	apiErr, ok := err.(*APIError)
-	if ok {
-		*target = apiErr
-	}
-	return ok
 }

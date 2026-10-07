@@ -13,7 +13,7 @@ import (
 
 const webhookTolerance = 5 * time.Minute
 
-// Event is the JSON body of a Voybit payment gateway webhook.
+// Event is a payment webhook body.
 type Event struct {
 	ID             string    `json:"id"`
 	Type           string    `json:"type"`
@@ -30,20 +30,15 @@ type Event struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// VerifyWebhook checks the signature on the raw request body.
-//
-// secret is the gateway webhook secret. headers are the three Voybit webhook
-// headers. rawBody must be the exact bytes Voybit sent, before JSON parsing.
-func VerifyWebhook(secret string, id, timestamp, signature string, rawBody []byte, now time.Time) error {
-	if secret == "" {
-		return errors.New("webhook secret is required")
-	}
-	if id == "" || timestamp == "" || !strings.HasPrefix(signature, "v1=") {
+// VerifyWebhook checks id, timestamp, and signature against the raw body.
+// secret is the gateway webhook secret. now may be zero to use the current time.
+func VerifyWebhook(secret, id, timestamp, signature string, rawBody []byte, now time.Time) error {
+	if secret == "" || id == "" || !strings.HasPrefix(signature, "v1=") {
 		return errors.New("webhook signature is invalid")
 	}
 	supplied, err := hex.DecodeString(strings.TrimPrefix(signature, "v1="))
 	seconds, stampErr := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil || stampErr != nil || len(supplied) != sha256.Size {
+	if err != nil || stampErr != nil || len(supplied) != sha256.Size || len(signature) != 3+sha256.Size*2 {
 		return errors.New("webhook signature is invalid")
 	}
 	if now.IsZero() {
@@ -57,15 +52,15 @@ func VerifyWebhook(secret string, id, timestamp, signature string, rawBody []byt
 		return errors.New("webhook timestamp is outside the 5 minute window")
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(id + "." + timestamp + "."))
-	mac.Write(rawBody)
+	_, _ = mac.Write([]byte(id + "." + timestamp + "."))
+	_, _ = mac.Write(rawBody)
 	if !hmac.Equal(mac.Sum(nil), supplied) {
 		return errors.New("webhook signature does not match")
 	}
 	return nil
 }
 
-// ParseEvent decodes a webhook body after VerifyWebhook has accepted it.
+// ParseEvent decodes a body that VerifyWebhook has already accepted.
 func ParseEvent(rawBody []byte) (Event, error) {
 	var event Event
 	if err := json.Unmarshal(rawBody, &event); err != nil {
