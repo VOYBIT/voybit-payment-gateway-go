@@ -1,5 +1,11 @@
 # Voybit payment gateway for Go
 
+## Get an API key
+
+1. Create an account at [dashboard.voybit.com](https://dashboard.voybit.com).
+2. Open **Gateways** and create a payment gateway. Keep it enabled. Copy the asset ID you will charge, and store the webhook secret (`whsec_…`) shown once at creation as `VOYBIT_WEBHOOK_SECRET`.
+3. Open **API keys**, choose **Create secret key**, and bind it to that gateway. Copy the full `vb_live_…` value once and store it as `VOYBIT_API_KEY` on your server.
+
 Create a payment and verify its webhook. Keep the API key and webhook secret on your server.
 
 ```bash
