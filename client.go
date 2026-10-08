@@ -16,11 +16,13 @@ import (
 
 const (
 	DefaultBaseURL = "https://api.voybit.com/api/v1"
-	userAgent      = "voybit-payment-gateway-go/0.1.0"
+	userAgent      = "voybit-payment-gateway-go/0.2.0"
 )
 
 var (
 	idempotencyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$`)
+	positiveDecimal    = regexp.MustCompile(`^(?:0|[1-9]\d*)(?:\.\d+)?$`)
+	fiatCurrency       = regexp.MustCompile(`^[A-Z]{3}$`)
 	errInvalidResponse = errors.New("payment gateway returned invalid JSON")
 )
 
@@ -46,6 +48,38 @@ type CreatePaymentRequest struct {
 	ExpiresInSeconds int64          `json:"expires_in_seconds,omitempty"`
 	Description      string         `json:"description,omitempty"`
 	Metadata         map[string]any `json:"metadata,omitempty"`
+}
+
+// CreateCheckoutSessionRequest starts hosted checkout without choosing a crypto asset.
+type CreateCheckoutSessionRequest struct {
+	FiatAmount           string         `json:"fiat_amount"`
+	FiatCurrency         string         `json:"fiat_currency"`
+	Description          string         `json:"description,omitempty"`
+	Metadata             map[string]any `json:"metadata,omitempty"`
+	PaymentWindowSeconds int64          `json:"payment_window_seconds,omitempty"`
+}
+
+// CheckoutSession is a hosted buyer-choice checkout returned by the gateway.
+type CheckoutSession struct {
+	ID                   string          `json:"id,omitempty"`
+	SessionID            string          `json:"session_id,omitempty"`
+	PublicID             string          `json:"public_id,omitempty"`
+	Status               string          `json:"status,omitempty"`
+	CheckoutURL          string          `json:"checkout_url"`
+	FiatAmount           string          `json:"fiat_amount,omitempty"`
+	FiatCurrency         string          `json:"fiat_currency,omitempty"`
+	Description          string          `json:"description,omitempty"`
+	Metadata             json.RawMessage `json:"metadata,omitempty"`
+	PaymentWindowSeconds int64           `json:"payment_window_seconds,omitempty"`
+	ExpiresAt            time.Time       `json:"expires_at,omitempty"`
+	CreatedAt            time.Time       `json:"created_at,omitempty"`
+}
+
+// CreatedCheckoutSession is one create-checkout-session result.
+type CreatedCheckoutSession struct {
+	CheckoutSession CheckoutSession
+	Replayed        bool
+	RequestID       string
 }
 
 // Payment is a payment gateway response.
@@ -153,6 +187,60 @@ func (c *Client) CreatePayment(ctx context.Context, request CreatePaymentRequest
 	return nil, last
 }
 
+// CreateCheckoutSession creates a hosted checkout where the buyer chooses an enabled asset.
+// Reuse idempotencyKey only when the request body is unchanged.
+func (c *Client) CreateCheckoutSession(ctx context.Context, request CreateCheckoutSessionRequest, idempotencyKey string) (*CreatedCheckoutSession, error) {
+	if strings.TrimSpace(c.APIKey) == "" {
+		return nil, errors.New("API key is required")
+	}
+	if !idempotencyPattern.MatchString(idempotencyKey) {
+		return nil, errors.New("Idempotency-Key must be 8 to 128 URL-safe characters")
+	}
+	if !positiveDecimal.MatchString(request.FiatAmount) || !strings.ContainsAny(request.FiatAmount, "123456789") {
+		return nil, errors.New("fiat_amount must be a positive decimal string")
+	}
+	if !fiatCurrency.MatchString(request.FiatCurrency) {
+		return nil, errors.New("fiat_currency must be a three-letter uppercase currency code")
+	}
+	if request.PaymentWindowSeconds < 0 {
+		return nil, errors.New("payment_window_seconds must be a positive integer")
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	base := strings.TrimRight(c.BaseURL, "/")
+	if base == "" {
+		base = DefaultBaseURL
+	}
+
+	var last error
+	for attempt := 0; attempt < 4; attempt++ {
+		created, retryAfter, err := c.postCheckoutSession(ctx, base+"/gateway/checkout-sessions", body, idempotencyKey)
+		if err == nil {
+			return created, nil
+		}
+		last = err
+		var apiErr *APIError
+		stop := errors.Is(err, errInvalidResponse) || ctx.Err() != nil || attempt == 3
+		if errors.As(err, &apiErr) {
+			stop = stop || !retryable(apiErr.Status)
+		} else if !isTransportError(err) {
+			stop = true
+		}
+		if stop {
+			return nil, err
+		}
+		if err := sleep(ctx, backoff(attempt, retryAfter)); err != nil {
+			return nil, err
+		}
+	}
+	if last == nil {
+		last = errors.New("payment gateway request failed")
+	}
+	return nil, last
+}
+
 func (c *Client) post(ctx context.Context, endpoint string, body []byte, idempotencyKey string) (*CreatedPayment, string, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -187,6 +275,45 @@ func (c *Client) post(ctx context.Context, endpoint string, body []byte, idempot
 			Payment:   payment,
 			Replayed:  response.Header.Get("Idempotency-Replayed") == "true",
 			RequestID: requestID,
+		}, "", nil
+	}
+	return nil, response.Header.Get("Retry-After"), decodeAPIError(response.StatusCode, requestID, raw)
+}
+
+func (c *Client) postCheckoutSession(ctx context.Context, endpoint string, body []byte, idempotencyKey string) (*CreatedCheckoutSession, string, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	httpRequest, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, "", err
+	}
+	httpRequest.Header.Set("X-Voybit-Api-Key", c.APIKey)
+	httpRequest.Header.Set("Idempotency-Key", idempotencyKey)
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "application/json")
+	httpRequest.Header.Set("User-Agent", userAgent)
+
+	response, err := c.httpClient().Do(httpRequest)
+	if err != nil {
+		return nil, "", err
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	requestID := response.Header.Get("X-Request-ID")
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		var session CheckoutSession
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &session); err != nil {
+				return nil, "", fmt.Errorf("%w: %v", errInvalidResponse, err)
+			}
+		}
+		return &CreatedCheckoutSession{
+			CheckoutSession: session,
+			Replayed:        response.Header.Get("Idempotency-Replayed") == "true",
+			RequestID:       requestID,
 		}, "", nil
 	}
 	return nil, response.Header.Get("Retry-After"), decodeAPIError(response.StatusCode, requestID, raw)

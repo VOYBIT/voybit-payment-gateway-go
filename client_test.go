@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -89,6 +90,69 @@ func TestCreatePaymentDoesNotRetryValidation(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "asset_unavailable" || apiErr.RequestID != "" || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+func TestCreateCheckoutSession(t *testing.T) {
+	var seen []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/gateway/checkout-sessions" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if r.Header.Get("X-Voybit-Api-Key") != "vb_test_example_secret" {
+			t.Errorf("api key = %s", r.Header.Get("X-Voybit-Api-Key"))
+		}
+		seen, _ = io.ReadAll(r.Body)
+		w.Header().Set("X-Request-ID", "req_session_1")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"session_id":"7155d76a-9f81-40eb-9233-878aac50eb20","public_id":"nYVvXxsYGr5LZk8Dn7hU0Q","status":"open","checkout_url":"https://voybit.com/pay/nYVvXxsYGr5LZk8Dn7hU0Q","fiat_amount":"25.00","fiat_currency":"USD"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, APIKey: "vb_test_example_secret", HTTP: server.Client()}
+	created, err := client.CreateCheckoutSession(context.Background(), CreateCheckoutSessionRequest{
+		FiatAmount:           "25.00",
+		FiatCurrency:         "USD",
+		Description:          "Order 1001",
+		Metadata:             map[string]any{"order_id": "1001"},
+		PaymentWindowSeconds: 1800,
+	}, "order:1001:attempt:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.CheckoutSession.Status != "open" ||
+		created.CheckoutSession.SessionID != "7155d76a-9f81-40eb-9233-878aac50eb20" ||
+		created.RequestID != "req_session_1" {
+		t.Fatalf("session = %#v", created)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(seen, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["fiat_amount"] != "25.00" || sent["fiat_currency"] != "USD" {
+		t.Fatalf("sent = %#v", sent)
+	}
+	if _, ok := sent["asset_id"]; ok {
+		t.Fatal("hosted checkout included asset_id")
+	}
+	if _, ok := sent["crypto_amount"]; ok {
+		t.Fatal("hosted checkout included crypto_amount")
+	}
+}
+
+func TestCreateCheckoutSessionValidatesInputs(t *testing.T) {
+	client := New("vb_test_example_secret")
+	_, err := client.CreateCheckoutSession(context.Background(), CreateCheckoutSessionRequest{
+		FiatAmount: "0", FiatCurrency: "USD",
+	}, "order:1001:attempt:1")
+	if err == nil || !strings.Contains(err.Error(), "positive decimal") {
+		t.Fatalf("amount error = %v", err)
+	}
+	_, err = client.CreateCheckoutSession(context.Background(), CreateCheckoutSessionRequest{
+		FiatAmount: "25.00", FiatCurrency: "usd",
+	}, "order:1001:attempt:1")
+	if err == nil || !strings.Contains(err.Error(), "three-letter") {
+		t.Fatalf("currency error = %v", err)
 	}
 }
 
